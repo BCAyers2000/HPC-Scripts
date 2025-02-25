@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+"""
+Quantum Espresso Output Parser - SCF and BFGS Convergence
+
+Author: Brad Ayers
+Date: 24 February 2025
+Version: 2.1
+
+Description:
+    This script parses output files from Quantum Espresso calculations,
+    extracting and displaying SCF iterations and BFGS optimisation steps.
+    It can generate ASCII plots of convergence and follow file updates in real-time.
+    Now with additional safety checks to detect convergence failures.
+
+Usage:
+    espresso_convergence.py [filename] [options]
+
+Requirements:
+    - Python 3.8 or higher
+
+Arguments:
+    filename            QE output file to parse (optional, will autodetect if not provided)
+
+Options:
+    --scf               Display SCF iterations
+    --opt               Display BFGS optimisation steps
+    -n, --num NUM       Limit iterations displayed to NUM
+    --plot              Generate ASCII convergence plots
+    -f, --follow        Follow file updates in real-time
+    --file-out FILE     Save output to specified file
+
+Examples:
+    espresso_convergence.py output.pwo --scf --plot
+    espresso_convergence.py --opt -n 5
+    espresso_convergence.py calculation.out -f --file-out monitor.log
+"""
+from collections import namedtuple
+from contextlib import redirect_stdout
+import re, os, sys, math, argparse, io, time
+from typing import List, Dict, Optional, Any, Tuple
+
+SCFIter = namedtuple("SCFIter", ["num", "energy", "delta_e", "converged"])
+BFGSIter = namedtuple(
+    "BFGSIter", ["step", "total_e", "free_e", "delta_f", "max_force", "converged"]
+)
+
+RE = {
+    "pwscf": re.compile(r"program pwscf", re.I),
+    "opt": re.compile(r"bfgs geometry optimization", re.I),
+    "e_err": re.compile(r"Energy\s+error\s*=\s*([0-9.E+-]+)\s*Ry"),
+    "g_err": re.compile(r"Gradient\s+error\s*=\s*([0-9.E+-]+)\s*Ry/Bohr"),
+    "scf_conv": re.compile(
+        r"convergence\s+has\s+been\s+achieved\s+in\s+(\d+)\s+iterations", re.I
+    ),
+    "tot_e": re.compile(r"!?\s*total\s+energy\s*=\s*(-?\d+\.\d+)\s*Ry", re.I),
+    "free_e": re.compile(r"internal\s+energy\s+E=F\+TS\s*=\s*(-?\d+\.\d+)\s*Ry", re.I),
+    "bfgs_conv": re.compile(
+        r"bfgs\s+converged\s+in\s+(\d+)\s+scf\s+cycles\s+and\s+(\d+)\s+bfgs\s+steps",
+        re.I,
+    ),
+    "scf_iter": re.compile(
+        r"iteration\s+#\s*(\d+).*?\n.*?total\s+energy\s*=\s*(-?\d+\.\d+).*?\n.*?estimated\s+scf\s+accuracy\s*<?[=\s]*(\d+\.\d+(?:E[+-]\d+)?|\d+\.\d+)",
+        re.DOTALL | re.I,
+    ),
+    "bfgs_failed": re.compile(r"bfgs\s+failed", re.I),
+    "scf_max_iter": re.compile(
+        r"convergence\s+NOT\s+achieved\s+after\s+\d+\s+iterations", re.I
+    ),
+    "bfgs_max_steps": re.compile(
+        r"The\s+maximum\s+number\s+of\s+steps\s+has\s+been\s+reached", re.I
+    ),
+}
+
+
+def find_qe_file() -> Optional[str]:
+    for f in [
+        f
+        for f in os.listdir(".")
+        if any(f.endswith(ext) for ext in (".out", ".pwo", ".scf", ".log"))
+    ]:
+        try:
+            with open(f, "r") as file:
+                if RE["pwscf"].search(file.read(8192)):
+                    return f
+        except:
+            pass
+    return None
+
+
+def check_convergence_failures(content: str) -> Tuple[bool, List[str]]:
+    """Check for convergence failures in the QE output and return failure details"""
+    failures = []
+
+    if RE["bfgs_failed"].search(content):
+        failures.append("BFGS Failure detected: BFGS algorithm failed to converge")
+
+    if RE["scf_max_iter"].search(content):
+        failures.append(
+            "SCF Failure detected: SCF exceeded maximum iterations without convergence"
+        )
+
+    if RE["bfgs_max_steps"].search(content):
+        failures.append(
+            "BFGS Failure detected: Maximum number of BFGS steps reached without convergence"
+        )
+
+    return bool(failures), failures
+
+
+def parse_scf(content: str) -> Tuple[List[SCFIter], bool, str]:
+    """Parse SCF iterations and check for SCF convergence failures"""
+    scf_failure = False
+    failure_message = ""
+
+    # Check for SCF max iterations failure
+    if RE["scf_max_iter"].search(content):
+        scf_failure = True
+        failure_message = "SCF has exceeded maximum number of iterations"
+
+    all_matches = []
+    for m in RE["scf_iter"].finditer(content):
+        try:
+            all_matches.append((int(m.group(1)), float(m.group(2)), float(m.group(3))))
+        except (ValueError, IndexError):
+            continue
+
+    if not all_matches:
+        return [], scf_failure, failure_message
+
+    if all_matches[0][0] == 1 and all_matches[-1][0] > 1:
+        blocks = []
+        current_block = []
+
+        for i, (num, energy, delta_e) in enumerate(all_matches):
+            if num == 1 and i > 0:
+                if current_block:
+                    blocks.append(current_block)
+                current_block = []
+            current_block.append((num, energy, delta_e))
+
+        if current_block:
+            blocks.append(current_block)
+
+        final_iters = blocks[-1] if blocks else all_matches
+    else:
+        final_iters = all_matches
+
+    conv_iters = [int(m) for m in RE["scf_conv"].findall(content)]
+    conv_iter = conv_iters[-1] if conv_iters else None
+    return (
+        [
+            SCFIter(
+                num,
+                energy,
+                delta_e,
+                (
+                    False
+                    if (num == final_iters[-1][0] and scf_failure)
+                    else (num == conv_iter if conv_iter else False)
+                ),
+            )
+            for num, energy, delta_e in final_iters
+        ],
+        scf_failure,
+        failure_message,
+    )
+
+
+def parse_bfgs(content: str) -> Tuple[List[BFGSIter], bool, str]:
+    """Parse BFGS iterations and check for BFGS convergence failures"""
+    bfgs_failure = False
+    failure_message = ""
+
+    # Check for BFGS failures
+    if RE["bfgs_failed"].search(content):
+        bfgs_failure = True
+        failure_message = "BFGS algorithm failed to converge"
+    elif RE["bfgs_max_steps"].search(content):
+        bfgs_failure = True
+        failure_message = "BFGS reached maximum number of steps without convergence"
+
+    tot_energies = [float(e) for e in RE["tot_e"].findall(content)]
+    free_energies = [float(e) for e in RE["free_e"].findall(content)]
+    delta_fs = RE["e_err"].findall(content)
+    max_forces = RE["g_err"].findall(content)
+
+    valid_lens = [
+        len(arr) for arr in [tot_energies, free_energies, delta_fs, max_forces] if arr
+    ]
+    if not valid_lens:
+        return [], bfgs_failure, failure_message
+
+    min_len = min(valid_lens)
+    is_converged = bool(RE["bfgs_conv"].search(content))
+
+    # Create BFGS iterations
+    return (
+        [
+            BFGSIter(
+                i + 1,
+                tot_energies[i] if i < len(tot_energies) else 0.0,
+                free_energies[i] if i < len(free_energies) else 0.0,
+                delta_fs[i] if i < len(delta_fs) else "0.0",
+                max_forces[i] if i < len(max_forces) else "0.0",
+                # If last step and failure detected, mark as not converged, otherwise normal check
+                (
+                    False
+                    if (i == min_len - 1 and bfgs_failure)
+                    else ((i == min_len - 1) and is_converged)
+                ),
+            )
+            for i in range(min_len)
+        ],
+        bfgs_failure,
+        failure_message,
+    )
+
+
+def print_table(
+    headers: List[str],
+    rows: List[List[Any]],
+    converged_idx: int = -1,
+    failure_message: str = "",
+) -> None:
+    widths = [
+        max(len(str(row[i])) for row in rows + [headers]) for i in range(len(headers))
+    ]
+
+    print("╔" + "╦".join("═" * (w + 2) for w in widths) + "╗")
+    print("║ " + " ║ ".join(f"{h:^{w}}" for h, w in zip(headers, widths)) + " ║")
+    print("╠" + "╬".join("═" * (w + 2) for w in widths) + "╣")
+
+    for i, row in enumerate(rows):
+        formatted = []
+        for j, (cell, w) in enumerate(zip(row, widths)):
+            if j == converged_idx and isinstance(cell, bool):
+                if cell:
+                    formatted.append(f"{'converged':^{w}}")
+                else:
+                    is_last_row = i == len(rows) - 1
+                    if is_last_row and failure_message:
+                        formatted.append(f"{'ERROR':^{w}}")
+                    else:
+                        formatted.append(f"{'----':^{w}}")
+            elif isinstance(cell, (int, float)) or (
+                isinstance(cell, str)
+                and (
+                    cell.replace(".", "", 1)
+                    .replace("E", "", 1)
+                    .replace("-", "", 1)
+                    .replace("+", "", 1)
+                    .isdigit()
+                )
+            ):
+                if j <= 1:
+                    formatted.append(f"{cell:<{w}}")
+                else:
+                    formatted.append(f"{cell:^{w}}")
+            else:
+                formatted.append(f"{cell:^{w}}")
+        print("║ " + " ║ ".join(formatted) + " ║")
+
+    print("╚" + "╩".join("═" * (w + 2) for w in widths) + "╝")
+
+    if failure_message:
+        print(f"\n  Error: {failure_message}")
+
+
+def create_plot_ascii(
+    x_data: List[float],
+    y_data: List[float],
+    title: str,
+    x_label: str,
+    y_label: str,
+    width: int = 60,
+    height: int = 20,
+    log_y: bool = True,
+) -> str:
+    """Generate ASCII plot from x and y data with logarithmic or linear y-scale"""
+    if len(x_data) <= 1 or len(y_data) <= 1:
+        return f"Not enough data to create {title} plot."
+
+    x_vals = x_data[: len(y_data)]
+    if len(x_vals) > width // 2:
+        step = max(1, len(x_vals) // (width // 2))
+        indices = list(range(0, len(x_vals) - 1, step)) + [len(x_vals) - 1]
+        x_vals = [float(x_vals[i]) for i in indices]
+        y_vals = [float(y_data[i]) for i in indices]
+    else:
+        x_vals = [float(x) for x in x_vals]
+        y_vals = [float(y) for y in y_data[: len(x_vals)]]
+
+    # Calculate y-axis tick positions
+    if log_y:
+        min_y = min((y for y in y_vals if y > 0), default=1e-10)
+        max_y = max(y_vals)
+        upper_exp = math.ceil(math.log10(max_y))
+        lower_exp = math.floor(math.log10(min_y))
+
+        if upper_exp - lower_exp >= height - 2:
+            step = max(1, math.ceil((upper_exp - lower_exp) / (height - 2)))
+            y_ticks = [10**exp for exp in range(upper_exp, lower_exp - 1, -step)]
+        else:
+            tpd = min(3, max(1, (height - 2) // max(1, upper_exp - lower_exp)))
+            y_ticks = []
+            for exp in range(upper_exp, lower_exp - 1, -1):
+                y_ticks.append(10**exp)
+                if tpd >= 3:
+                    y_ticks.extend([5 * 10 ** (exp - 1), 2 * 10 ** (exp - 1)])
+                elif tpd == 2:
+                    y_ticks.append(3 * 10 ** (exp - 1))
+        y_ticks = y_ticks[:height]
+    else:
+        min_y, max_y = min(y_vals), max(y_vals)
+        margin = (max_y - min_y) * 0.1
+        y_ticks = [
+            max_y + margin - i * ((max_y - min_y) + 2 * margin) / (height - 1)
+            for i in range(height)
+        ]
+
+    # Generate y-axis labels
+    y_labels = []
+    for tick in y_ticks:
+        if log_y:
+            log_tick = math.log10(tick)
+            y_labels.append(
+                f"1E{int(round(log_tick)):+d}"
+                if abs(log_tick - round(log_tick)) < 1e-10
+                else ""
+            )
+        else:
+            y_labels.append(
+                f"{tick:.2e}" if abs(tick) < 0.01 or abs(tick) > 1000 else f"{tick:.6f}"
+            )
+
+    # Setup x-axis ticks
+    min_x, max_x = min(x_vals), max(x_vals)
+    is_iter = all(x == int(x) for x in x_vals) and min_x == 1
+
+    if is_iter:
+        max_iter = int(max_x)
+        interval = next(
+            (i for i in [1, 2, 5, 10, 20, 50] if max_iter // i <= 10),
+            max(1, max_iter // 10),
+        )
+        tick_vals = list(range(1, max_iter + 1, interval))
+        if tick_vals and tick_vals[-1] != max_iter:
+            tick_vals.append(max_iter)
+        tick_pos = [
+            int(round((val - 1) * (width - 1) / (max_iter - 1))) if max_iter > 1 else 0
+            for val in tick_vals
+        ]
+    else:
+        count = min(11, len(x_vals))
+        tick_indices = [
+            int(round(i * (len(x_vals) - 1) / (count - 1))) if count > 1 else 0
+            for i in range(count)
+        ]
+        tick_vals = [x_vals[i] for i in tick_indices]
+        tick_pos = [
+            int(round(i * (width - 1) / (count - 1))) if count > 1 else 0
+            for i in range(count)
+        ]
+
+    # Map data points to grid coordinates
+    points = []
+    for x, y in zip(x_vals, y_vals):
+        x_pos = (
+            (int(round((x - 1) * (width - 1) / (max_x - 1))) if max_x > 1 else 0)
+            if is_iter
+            else (
+                int(round((x - min_x) / (max_x - min_x) * (width - 1)))
+                if max_x > min_x
+                else 0
+            )
+        )
+
+        # Y position
+        if y <= 0 and log_y:
+            y_pos = len(y_ticks) - 1
+        elif log_y:
+            log_y_val = math.log10(y) if y > 0 else 0
+            y_pos = len(y_ticks) - 1
+            for i in range(len(y_ticks) - 1):
+                if math.log10(y_ticks[i]) >= log_y_val >= math.log10(y_ticks[i + 1]):
+                    y_pos = i + (log_y_val - math.log10(y_ticks[i])) / (
+                        math.log10(y_ticks[i + 1]) - math.log10(y_ticks[i])
+                    )
+                    break
+        else:
+            y_pos = len(y_ticks) - 1
+            for i in range(len(y_ticks) - 1):
+                if y_ticks[i] >= y >= y_ticks[i + 1]:
+                    y_pos = i + (y - y_ticks[i]) / (y_ticks[i + 1] - y_ticks[i])
+                    break
+
+        points.append((int(round(y_pos)), 12 + x_pos))
+
+    # Create grid
+    grid = [f"{label:>10} │" + " " * width for label in y_labels]
+    for i, (y_pos, x_pos) in enumerate(points):
+        if 0 <= y_pos < len(grid) and x_pos < len(grid[y_pos]):
+            grid[y_pos] = grid[y_pos][:x_pos] + "●" + grid[y_pos][x_pos + 1 :]
+
+            if i > 0:
+                prev_y, prev_x = points[i - 1]
+                for x in range(min(prev_x, x_pos) + 1, max(prev_x, x_pos)):
+                    prog = (x - prev_x) / (x_pos - prev_x) if x_pos != prev_x else 0
+                    y = int(round(prev_y + prog * (y_pos - prev_y)))
+                    if (
+                        0 <= y < len(grid)
+                        and x < len(grid[y])
+                        and grid[y][x] not in "●│─└┘"
+                    ):
+                        grid[y] = grid[y][:x] + "·" + grid[y][x + 1 :]
+
+    # Create x-axis
+    x_line = " " * 11 + "└" + "─" * width
+    tick_line = " " * 11 + " "
+    label_line = " " * 12
+
+    # Add tick marks and labels
+    for val, pos in zip(tick_vals, tick_pos):
+        idx = 12 + pos
+        tick_line = (
+            tick_line[:idx] + "│" + tick_line[idx + 1 :]
+            if idx < len(tick_line)
+            else tick_line + " " * (idx - len(tick_line)) + "│"
+        )
+
+        label = str(int(val)) if val == int(val) else f"{val:.1f}"
+        start = 12 + pos - len(label) // 2
+
+        if start + len(label) > len(label_line):
+            label_line += " " * (start + len(label) - len(label_line))
+
+        if all(
+            i >= len(label_line) or label_line[i] == " "
+            for i in range(start, min(start + len(label), len(label_line)))
+        ):
+            label_line = label_line[:start] + label + label_line[start + len(label) :]
+
+    # Assemble the plot
+    return "\n".join(
+        [
+            "╔" + "═" * (width + 12) + "╗",
+            "║" + title.center(width + 12) + "║",
+            "╚" + "═" * (width + 12) + "╝",
+            "",
+            *grid,
+            x_line,
+            tick_line,
+            label_line,
+            "",
+            f"Y-axis: {y_label}" + (" (logarithmic scale)" if log_y else ""),
+            f"X-axis: {x_label}",
+        ]
+    )
+
+
+def plot_scf_convergence(iters: List[SCFIter]) -> str:
+    """Generate ASCII plot for SCF convergence"""
+    return create_plot_ascii(
+        [it.num for it in iters],
+        [it.delta_e for it in iters],
+        "SCF Convergence",
+        "SCF Iterations",
+        "Delta E (Ry)",
+    )
+
+
+def plot_bfgs_convergence(iters: List[BFGSIter]) -> str:
+    """Generate ASCII plots for BFGS convergence (energy and force)"""
+    width = 80 if len(iters) > 30 else 60
+    steps = [it.step for it in iters]
+
+    return (
+        create_plot_ascii(
+            steps,
+            [float(it.delta_f) for it in iters],
+            "BFGS Energy Error Convergence",
+            "BFGS Iterations",
+            "Delta F (Ry)",
+            width=width,
+        )
+        + "\n\n"
+        + create_plot_ascii(
+            steps,
+            [float(it.max_force) for it in iters],
+            "BFGS Force Convergence",
+            "BFGS Iterations",
+            "Max Force (Ry/Bohr)",
+            width=width,
+        )
+    )
+
+
+def process_file(content: str, filename: str, config: Dict[str, Any]) -> None:
+    show_scf = config.get("show_scf", False)
+    show_opt = config.get("show_opt", False)
+    num_iters = config.get("num_iterations", None)
+    show_plot = config.get("show_plot", False)
+    is_following = config.get("is_following", False)
+
+    # Only check for specific error patterns in the content
+    has_failures, failure_messages = check_convergence_failures(content)
+
+    if not show_scf and not show_opt:
+        show_opt = bool(RE["opt"].search(content))
+        show_scf = not show_opt
+
+    if show_opt:
+        bfgs_iters, bfgs_failure, bfgs_failure_msg = parse_bfgs(content)
+        if not bfgs_iters or all(
+            it.delta_f == "0.0" and it.max_force == "0.0" for it in bfgs_iters
+        ):
+            print(
+                "No valid BFGS optimisation data found. Use --scf to show SCF iterations instead."
+            )
+            sys.exit(1)
+
+        subset = (
+            bfgs_iters[-num_iters:]
+            if num_iters and 0 < num_iters < len(bfgs_iters)
+            else bfgs_iters
+        )
+        display_msg = (
+            f"Last {num_iters} " if num_iters and num_iters < len(bfgs_iters) else ""
+        )
+
+        print(
+            f"\n{display_msg}BFGS Geometry Optimisation Steps{'' if is_following else ' from ' + filename}:"
+        )
+        print_table(
+            [
+                "Step",
+                "Total Energy (Ry)",
+                "Free Energy (Ry)",
+                "Delta F (Ry)",
+                "Max Force (Ry/a0)",
+                "Convergence",
+            ],
+            [
+                [
+                    it.step,
+                    f"{it.total_e:.8f}",
+                    f"{it.free_e:.8f}",
+                    it.delta_f,
+                    it.max_force,
+                    it.converged,
+                ]
+                for it in subset
+            ],
+            5,
+            # Only print failure message if specific error regex was found
+            bfgs_failure_msg if bfgs_failure else "",
+        )
+
+        if show_plot and not all(it.delta_f == "0.0" for it in bfgs_iters):
+            print("\n" + plot_bfgs_convergence(subset))
+        return
+
+    if show_scf:
+        scf_iters, scf_failure, scf_failure_msg = parse_scf(content)
+        if not scf_iters:
+            print("No SCF iteration data found in the file.")
+            sys.exit(1)
+
+        subset = (
+            scf_iters[-num_iters:]
+            if num_iters and 0 < num_iters < len(scf_iters)
+            else scf_iters
+        )
+        display_msg = (
+            f"Last {num_iters} " if num_iters and num_iters < len(scf_iters) else ""
+        )
+
+        rows = [
+            [it.num, f"{it.energy:.8f}", f"{it.delta_e:.2E}", it.converged]
+            for it in subset
+        ]
+
+        print(
+            f"\n{display_msg}SCF Iterations{'' if is_following else ' from ' + filename}:"
+        )
+        print_table(
+            ["Iteration", "Energy (Ry)", "ΔE (Ry)", "Convergence"],
+            rows,
+            3,
+            # Only print failure message if specific error regex was found
+            scf_failure_msg if scf_failure else "",
+        )
+
+        if show_plot:
+            print("\n" + plot_scf_convergence(subset))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Parse QE output file for SCF and BFGS information"
+    )
+    parser.add_argument(
+        "filename", nargs="?", default=None, help="QE output file to parse"
+    )
+    parser.add_argument("--scf", action="store_true", help="Print SCF table")
+    parser.add_argument("--opt", action="store_true", help="Print BFGS table")
+    parser.add_argument("-n", "--num", type=int, help="Limit iterations displayed")
+    parser.add_argument("--plot", action="store_true", help="Generate ASCII plots")
+    parser.add_argument(
+        "--f", "--follow", dest="f", action="store_true", help="Follow file updates"
+    )
+    parser.add_argument("--file-out", type=str, help="Save output to file")
+    args = parser.parse_args()
+
+    filename = args.filename or find_qe_file()
+    if not filename:
+        print("Error: No QE output file found.")
+        sys.exit(1)
+
+    config = {
+        "show_scf": args.scf,
+        "show_opt": args.opt,
+        "num_iterations": args.num,
+        "show_plot": args.plot,
+        "is_following": args.f,
+    }
+
+    try:
+        if args.f:
+            last_size = 0
+            while True:
+                try:
+                    current_size = os.path.getsize(filename)
+
+                    if current_size != last_size:
+                        with open(filename, "r") as f:
+                            content = f.read()
+
+                        last_size = current_size
+                        os.system("cls" if os.name == "nt" else "clear")
+                        process_file(content, filename, config)
+                        print(f"\nFollowing '{filename}'... Press Ctrl+C to stop.")
+
+                    time.sleep(1)
+                except FileNotFoundError:
+                    print(f"\nFile {filename} not found. Waiting for it to appear...")
+                    time.sleep(2)
+        else:
+            with open(filename, "r") as f:
+                content = f.read()
+
+            if args.file_out:
+                with open(args.file_out, "w") as f, redirect_stdout(
+                    io.StringIO()
+                ) as buf:
+                    process_file(content, filename, config)
+                    f.write(buf.getvalue())
+                print(f"\nOutput has been saved to: {args.file_out}")
+            else:
+                process_file(content, filename, config)
+
+    except KeyboardInterrupt:
+        print("\nFollow mode terminated.")
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
